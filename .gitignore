@@ -29,5 +29,23 @@ build/
 !**/src/main/**/build/
 !**/src/test/**/build/
 
+### Environment Variables ###
+.env
+application-local.properties
+*secret*
+*credential*
+
+# Logs
+*.log
+
 ### VS Code ###
 .vscode/
+
+# Compiled files
+target/
+*.class
+
+# Maven
+.mvn/
+mvnw
+mvnw.cmd
