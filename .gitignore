@@ -49,3 +49,6 @@ target/
 .mvn/
 mvnw
 mvnw.cmd
+
+### Local Settings ###
+*.local*
