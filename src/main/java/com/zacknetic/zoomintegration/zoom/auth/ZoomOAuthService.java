@@ -11,59 +11,104 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Service for handling Zoom Server-to-Server OAuth authentication
+ * Handles getting and caching OAuth tokens for Zoom API calls.
+ *
+ * Zoom needs an auth token for every API call. Instead of fetching a new token
+ * every single time (which would be slow and wasteful), we cache it and reuse it
+ * until it's about to expire. The caching is thread-safe, so multiple requests
+ * can happen at once without causing problems.
  */
 @Service
 public class ZoomOAuthService {
-    
+
     private static final Logger log = LoggerFactory.getLogger(ZoomOAuthService.class);
-    
+
     private final ZoomConfig zoomConfig;
     private final OkHttpClient httpClient;
     private final ObjectMapper objectMapper;
+
+    // Thread-safe token cache using AtomicReference
+    private final AtomicReference<TokenCache> tokenCache = new AtomicReference<>();
+
+    /**
+     * Holds a token and its expiry time together as one immutable object.
+     *
+     * Being immutable means once it's created, it can't be changed. This makes it
+     * safe to share between threads without worrying about race conditions.
+     */
+    private static class TokenCache {
+        final String accessToken;
+        final Instant tokenExpiry;
+
+        TokenCache(String accessToken, Instant tokenExpiry) {
+            this.accessToken = accessToken;
+            this.tokenExpiry = tokenExpiry;
+        }
+    }
     
-    // Cached token
-    private String accessToken;
-    private Instant tokenExpiry;
-    
-    public ZoomOAuthService(ZoomConfig zoomConfig) {
+    public ZoomOAuthService(ZoomConfig zoomConfig, OkHttpClient httpClient) {
         this.zoomConfig = zoomConfig;
-        this.httpClient = new OkHttpClient();
+        this.httpClient = httpClient;
         this.objectMapper = new ObjectMapper();
     }
     
     /**
-     * Get a valid access token, refreshing if necessary
+     * Gets a valid Zoom API token, fetching a new one only if needed.
+     *
+     * First checks if we have a cached token that's still good. If so, returns it immediately.
+     * If not, fetches a fresh one from Zoom. Uses locking to make sure multiple threads
+     * don't all try to fetch new tokens at the same time.
      */
     public String getAccessToken() throws IOException {
-        if (isTokenValid()) {
+        TokenCache cache = tokenCache.get();
+
+        // Fast path: token is valid, return immediately
+        if (isTokenValid(cache)) {
             log.debug("Using cached access token");
-            return accessToken;
+            return cache.accessToken;
         }
-        
-        log.info("Fetching new access token from Zoom");
-        return fetchNewToken();
+
+        // Slow path: need to refresh token
+        // Use synchronized block to prevent multiple threads from refreshing simultaneously
+        synchronized (this) {
+            // Double-check: another thread might have refreshed while we waited
+            cache = tokenCache.get();
+            if (isTokenValid(cache)) {
+                log.debug("Using cached access token (refreshed by another thread)");
+                return cache.accessToken;
+            }
+
+            log.info("Fetching new access token from Zoom");
+            return fetchNewToken();
+        }
     }
-    
+
     /**
-     * Check if current token is still valid
+     * Checks if we can still use the cached token.
+     *
+     * A token is considered valid if it exists and won't expire for at least 5 more minutes.
+     * The 5-minute buffer gives us time to make API calls without the token expiring mid-request.
      */
-    private boolean isTokenValid() {
-        if (accessToken == null || tokenExpiry == null) {
+    private boolean isTokenValid(TokenCache cache) {
+        if (cache == null || cache.accessToken == null || cache.tokenExpiry == null) {
             return false;
         }
-        
+
         // Consider token expired 5 minutes before actual expiry
         Instant now = Instant.now();
-        Instant expiryWithBuffer = tokenExpiry.minusSeconds(300);
-        
+        Instant expiryWithBuffer = cache.tokenExpiry.minusSeconds(300);
+
         return now.isBefore(expiryWithBuffer);
     }
     
    /**
-     * Fetch a new access token from Zoom OAuth endpoint
+     * Actually goes to Zoom and gets a fresh access token.
+     *
+     * This is called when we don't have a token cached or the cached one is expired.
+     * We send our client credentials to Zoom and they give us back a token we can use.
      */
     private String fetchNewToken() throws IOException {
         
@@ -101,18 +146,19 @@ public class ZoomOAuthService {
             log.debug("Token response: {}", responseBody);
             
             ZoomTokenResponse tokenResponse = objectMapper.readValue(
-                responseBody, 
+                responseBody,
                 ZoomTokenResponse.class
             );
-            
-            // Cache the token
-            this.accessToken = tokenResponse.getAccessToken();
-            this.tokenExpiry = Instant.now().plusSeconds(tokenResponse.getExpiresIn());
-            
-            log.info("Successfully obtained access token, expires in {} seconds", 
+
+            // Cache the token using AtomicReference for thread-safety
+            String newToken = tokenResponse.getAccessToken();
+            Instant newExpiry = Instant.now().plusSeconds(tokenResponse.getExpiresIn());
+            tokenCache.set(new TokenCache(newToken, newExpiry));
+
+            log.info("Successfully obtained access token, expires in {} seconds",
                     tokenResponse.getExpiresIn());
-            
-            return this.accessToken;
+
+            return newToken;
         }
     }
 }

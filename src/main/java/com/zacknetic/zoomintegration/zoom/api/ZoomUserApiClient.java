@@ -33,11 +33,12 @@ public class ZoomUserApiClient {
     public ZoomUserApiClient(
             ZoomConfig zoomConfig,
             ZoomOAuthService oauthService,
-            PIIRedactionService redactionService) {
+            PIIRedactionService redactionService,
+            OkHttpClient httpClient) {
         this.zoomConfig = zoomConfig;
         this.oauthService = oauthService;
         this.redactionService = redactionService;
-        this.httpClient = new OkHttpClient();
+        this.httpClient = httpClient;
         this.objectMapper = new ObjectMapper();
     }
     

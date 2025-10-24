@@ -4,10 +4,11 @@ import org.springframework.stereotype.Service;
 import java.util.regex.Pattern;
 
 /**
- * Service for redacting PII from logs and responses
- * 
- * Protects sensitive information like emails, phone numbers, and SSNs
- * from appearing in application logs
+ * Automatically removes or masks sensitive personal information from logs.
+ *
+ * Nobody wants their email, phone number, or credit card showing up in plain text
+ * in log files. This service finds that kind of stuff and redacts it before logging,
+ * so we can debug issues without leaking user data.
  */
 @Service
 public class PIIRedactionService {
@@ -30,7 +31,10 @@ public class PIIRedactionService {
     );
     
     /**
-     * Redact all PII from a string for safe logging
+     * Scans text for sensitive info and redacts it before logging.
+     *
+     * This catches emails, phone numbers, SSNs, and credit cards. The original text
+     * structure stays intact so you can still debug, but the sensitive bits are masked.
      */
     public String redactForLogging(String text) {
         if (text == null || text.isEmpty()) {
@@ -55,7 +59,7 @@ public class PIIRedactionService {
     }
     
     /**
-     * Redact email address for safe logging
+     * Redacts just email addresses, keeping the first letters for identification.
      */
     public String redactEmail(String email) {
         if (email == null || email.isEmpty()) {
@@ -66,7 +70,11 @@ public class PIIRedactionService {
     }
     
     /**
-     * Mask a token or secret, showing only first and last few characters
+     * Shows just the beginning and end of a token, hiding the middle.
+     *
+     * Useful when you need to identify which token you're looking at without
+     * exposing the actual secret. Like showing "eyJhbG...3ODkwIn0" instead of
+     * the full JWT token.
      */
     public String maskToken(String token) {
         if (token == null || token.length() < 20) {
@@ -77,7 +85,9 @@ public class PIIRedactionService {
     }
     
     /**
-     * Check if text contains potential PII
+     * Quickly checks if text has any sensitive info in it.
+     *
+     * Handy when you want to know if you should redact something before logging it.
      */
     public boolean containsPII(String text) {
         if (text == null || text.isEmpty()) {
