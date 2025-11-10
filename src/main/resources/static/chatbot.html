@@ -335,13 +335,19 @@
             sendBtn.textContent = 'Sending...';
 
             try {
+                // Get user's timezone
+                const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                
                 const response = await fetch('/api/chatbot/chat', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${accessToken}`
                     },
-                    body: JSON.stringify({ message: message })
+                    body: JSON.stringify({ 
+                        message: message,
+                        timezone: timezone
+                    })
                 });
 
                 if (response.status === 401) {

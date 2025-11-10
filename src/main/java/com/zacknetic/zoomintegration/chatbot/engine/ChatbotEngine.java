@@ -40,6 +40,7 @@ public class ChatbotEngine {
     private final ChatbotConfiguration config;
     private final ZoomMeetingsApiClient meetingsApiClient;
     private final UserZoomApiService userZoomApiService;
+    private final TimezoneService timezoneService;
 
     public ChatbotEngine(
         IntentClassifier intentClassifier,
@@ -47,7 +48,8 @@ public class ChatbotEngine {
         ConversationContextManager contextManager,
         ChatbotConfiguration config,
         ZoomMeetingsApiClient meetingsApiClient,
-        UserZoomApiService userZoomApiService
+        UserZoomApiService userZoomApiService,
+        TimezoneService timezoneService
     ) {
         this.intentClassifier = intentClassifier;
         this.entityExtractor = entityExtractor;
@@ -55,6 +57,7 @@ public class ChatbotEngine {
         this.config = config;
         this.meetingsApiClient = meetingsApiClient;
         this.userZoomApiService = userZoomApiService;
+        this.timezoneService = timezoneService;
     }
 
     /**
@@ -66,9 +69,10 @@ public class ChatbotEngine {
      *
      * @param userId User ID (for session management)
      * @param messageText User's message
+     * @param timezone User's timezone ID (optional)
      * @return ChatbotResponse containing bot's reply and metadata
      */
-    public ChatbotResponse processMessage(String userId, String messageText) {
+    public ChatbotResponse processMessage(String userId, String messageText, String timezone) {
         // Validate input
         if (userId == null || userId.isBlank()) {
             log.error("User ID is required for chat processing");
@@ -86,11 +90,16 @@ public class ChatbotEngine {
         // Sanitize input
         String sanitizedMessage = sanitizeInput(messageText);
 
-        log.info("Processing message from user: {}", userId);
+        log.info("Processing message from user: {} with timezone: {}", userId, timezone);
 
         try {
             // Get or create conversation session
             ConversationSession session = contextManager.getOrCreateSession(userId);
+            
+            // Store timezone in session context if provided
+            if (timezone != null && !timezone.isBlank()) {
+                session.setContextValue("timezone", timezone);
+            }
 
             // Create user message
             ChatMessage userMessage = ChatMessage.userMessage(session.getSessionId(), sanitizedMessage);
@@ -285,10 +294,17 @@ public class ChatbotEngine {
         String finalTime = time != null ? time : session.getContextValue("meetingTime");
         String participant = email != null ? email : session.getContextValue("participantEmail");
         String meetingDuration = duration != null ? duration : session.getContextValue("meetingDuration");
+        String userTimezone = session.getContextValue("timezone"); // Get user's timezone
 
         try {
-            // Combine date and time into ISO 8601 format
-            String startTime = combineDateTime(finalDate, finalTime);
+            // Convert local time to UTC for Zoom API
+            String startTimeUtc;
+            if (userTimezone != null && !userTimezone.isBlank()) {
+                startTimeUtc = timezoneService.convertLocalToUtc(finalDate, finalTime, userTimezone);
+            } else {
+                // Fallback to simple combination if no timezone
+                startTimeUtc = combineDateTime(finalDate, finalTime);
+            }
 
             // Parse duration or use default
             int durationMinutes = 60; // default
@@ -304,9 +320,9 @@ public class ChatbotEngine {
             ZoomMeetingRequest request = ZoomMeetingRequest.builder()
                 .topic("Scheduled Meeting") // Default topic
                 .type(2) // Scheduled meeting
-                .startTime(startTime)
+                .startTime(startTimeUtc)
                 .duration(durationMinutes)
-                .timezone("UTC")
+                .timezone("UTC") // Always store in UTC
                 .settings(com.zacknetic.zoomintegration.zoom.models.ZoomMeetingSettings.builder()
                     .hostVideo(true)
                     .participantVideo(true)
@@ -317,7 +333,8 @@ public class ChatbotEngine {
                 .build();
 
             // Create meeting via Zoom API using user's token
-            log.info("Creating Zoom meeting for user: {} at {}", session.getUserId(), startTime);
+            log.info("Creating Zoom meeting for user: {} at UTC: {} (local: {} {} {})", 
+                session.getUserId(), startTimeUtc, finalDate, finalTime, userTimezone);
 
             // Get user's Zoom access token
             String userAccessToken = userZoomApiService.getAccessTokenForUser(session.getUserId());
@@ -334,7 +351,15 @@ public class ChatbotEngine {
             // Format success response
             StringBuilder response = new StringBuilder();
             response.append("Meeting scheduled successfully!\n\n");
-            response.append("When: ").append(formatDateTime(finalDate, finalTime)).append("\n");
+            
+            // Display time in user's local timezone
+            if (userTimezone != null && !userTimezone.isBlank()) {
+                String formattedTime = timezoneService.formatLocalDateTime(finalDate, finalTime, userTimezone);
+                response.append("When: ").append(formattedTime).append("\n");
+            } else {
+                response.append("When: ").append(formatDateTime(finalDate, finalTime)).append("\n");
+            }
+            
             response.append("Duration: ").append(durationMinutes).append(" minutes\n");
             response.append("Meeting ID: ").append(meeting.getId()).append("\n");
 
@@ -345,8 +370,12 @@ public class ChatbotEngine {
             response.append("\nJoin URL: ").append(meeting.getJoinUrl()).append("\n");
 
             if (participant != null) {
-                response.append("\nTo invite ").append(participant)
-                    .append(", share the join URL above.");
+                // Log the invite attempt (email sending not yet implemented)
+                sendMeetingInvite(participant, meeting, finalDate, finalTime, durationMinutes, userTimezone);
+                
+                response.append("\n📧 To invite ").append(participant).append(":\n");
+                response.append("   Please share the join URL above with them.\n");
+                response.append("   (Automatic email invites require email service integration)");
             }
 
             return response.toString();
@@ -385,7 +414,7 @@ public class ChatbotEngine {
             String userAccessToken = userZoomApiService.getAccessTokenForUser(session.getUserId());
 
             ZoomMeetingList meetingList = meetingsApiClient.listMeetingsWithUserToken(
-                "me", "upcoming", 10, 1, userAccessToken
+                "me", "scheduled", 10, 1, userAccessToken
             );
 
             if (meetingList.isEmpty()) {
@@ -398,6 +427,8 @@ public class ChatbotEngine {
             response.append("Your upcoming meetings:\n\n");
 
             List<ZoomMeeting> meetings = meetingList.getMeetings();
+            String userTimezone = session.getContextValue("timezone");
+            
             for (int i = 0; i < meetings.size(); i++) {
                 ZoomMeeting meeting = meetings.get(i);
 
@@ -409,7 +440,18 @@ public class ChatbotEngine {
                 response.append("\n");
 
                 if (meeting.getStartTime() != null) {
-                    response.append("   ").append(meeting.getStartTime()).append("\n");
+                    // Convert UTC time to user's local timezone for display
+                    if (userTimezone != null && !userTimezone.isBlank()) {
+                        try {
+                            String localTime = timezoneService.convertUtcToLocal(meeting.getStartTime(), userTimezone);
+                            response.append("   ").append(localTime).append("\n");
+                        } catch (Exception e) {
+                            log.warn("Failed to convert meeting time to local timezone", e);
+                            response.append("   ").append(meeting.getStartTime()).append("\n");
+                        }
+                    } else {
+                        response.append("   ").append(meeting.getStartTime()).append("\n");
+                    }
                 }
 
                 response.append("   ID: ").append(meeting.getId()).append("\n\n");
@@ -465,7 +507,19 @@ public class ChatbotEngine {
             response.append("Topic: ").append(meeting.getTopic() != null ? meeting.getTopic() : "N/A").append("\n");
 
             if (meeting.getStartTime() != null) {
-                response.append("When: ").append(meeting.getStartTime()).append("\n");
+                String userTimezone = session.getContextValue("timezone");
+                // Convert UTC time to user's local timezone for display
+                if (userTimezone != null && !userTimezone.isBlank()) {
+                    try {
+                        String localTime = timezoneService.convertUtcToLocal(meeting.getStartTime(), userTimezone);
+                        response.append("When: ").append(localTime).append("\n");
+                    } catch (Exception e) {
+                        log.warn("Failed to convert meeting time to local timezone", e);
+                        response.append("When: ").append(meeting.getStartTime()).append("\n");
+                    }
+                } else {
+                    response.append("When: ").append(meeting.getStartTime()).append("\n");
+                }
             }
 
             if (meeting.getDuration() != null) {
@@ -772,6 +826,82 @@ public class ChatbotEngine {
         }
 
         return sanitized;
+    }
+
+    /**
+     * Logs meeting invite details for the participant.
+     * 
+     * TODO: To implement actual email sending, integrate with an email service:
+     * 
+     * Option 1 - Spring Boot Mail (SMTP):
+     *   1. Add dependency: spring-boot-starter-mail
+     *   2. Configure SMTP in application.properties (Gmail, SendGrid, etc.)
+     *   3. Use JavaMailSender to send emails with calendar attachments
+     * 
+     * Option 2 - SendGrid API:
+     *   1. Add dependency: sendgrid-java
+     *   2. Get SendGrid API key
+     *   3. Use SendGrid client to send transactional emails
+     * 
+     * Option 3 - AWS SES:
+     *   1. Add dependency: aws-java-sdk-ses
+     *   2. Configure AWS credentials
+     *   3. Use SES client to send emails
+     * 
+     * @param participantEmail Email address to send invite to
+     * @param meeting Created Zoom meeting
+     * @param date Meeting date (local)
+     * @param time Meeting time (local)
+     * @param duration Meeting duration in minutes
+     * @param timezone User's timezone
+     */
+    private void sendMeetingInvite(String participantEmail, ZoomMeeting meeting, 
+                                   String date, String time, int duration, String timezone) {
+        // Format the meeting time for display
+        String formattedTime;
+        if (timezone != null && !timezone.isBlank()) {
+            formattedTime = timezoneService.formatLocalDateTime(date, time, timezone);
+        } else {
+            formattedTime = formatDateTime(date, time);
+        }
+        
+        log.info("=== Meeting Invite Details ===");
+        log.info("Recipient: {}", participantEmail);
+        log.info("Time: {}", formattedTime);
+        log.info("Duration: {} minutes", duration);
+        log.info("Join URL: {}", meeting.getJoinUrl());
+        log.info("Meeting ID: {}", meeting.getId());
+        if (meeting.getPassword() != null) {
+            log.info("Password: {}", meeting.getPassword());
+        }
+        log.info("==============================");
+        
+        // Example email implementation (commented out):
+        /*
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true);
+            
+            helper.setTo(participantEmail);
+            helper.setSubject("Zoom Meeting Invitation");
+            helper.setText(String.format(
+                "You're invited to a Zoom meeting!\n\n" +
+                "Time: %s\n" +
+                "Duration: %d minutes\n\n" +
+                "Join URL: %s\n" +
+                "Meeting ID: %s\n" +
+                "Password: %s",
+                formattedTime, duration, meeting.getJoinUrl(), 
+                meeting.getId(), meeting.getPassword()
+            ));
+            
+            mailSender.send(message);
+            log.info("Email invite sent successfully to {}", participantEmail);
+        } catch (Exception e) {
+            log.error("Failed to send email invite", e);
+            throw new RuntimeException("Failed to send invite email", e);
+        }
+        */
     }
 
     /**

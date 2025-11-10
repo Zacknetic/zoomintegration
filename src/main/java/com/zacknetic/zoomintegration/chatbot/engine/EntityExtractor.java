@@ -57,6 +57,14 @@ public class EntityExtractor {
     private static final Pattern DATE_SLASH_PATTERN = Pattern.compile(
         "\\b(0?[1-9]|1[0-2])/(0?[1-9]|[12][0-9]|3[01])/(\\d{2,4})\\b"
     );
+    
+    // Month name patterns (e.g., "november 4th", "nov 4", "january 15")
+    private static final Pattern DATE_MONTH_NAME_PATTERN = Pattern.compile(
+        "\\b(january|february|march|april|may|june|july|august|september|october|november|december|" +
+        "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\\s+" +
+        "(\\d{1,2})(st|nd|rd|th)?\\b",
+        Pattern.CASE_INSENSITIVE
+    );
 
     // Duration patterns (e.g., "30 minutes", "1 hour")
     private static final Pattern DURATION_PATTERN = Pattern.compile(
@@ -125,7 +133,7 @@ public class EntityExtractor {
 
     /**
      * Extract dates from message.
-     * Production: Handles multiple date formats
+     * Production: Handles multiple date formats including month names
      */
     private void extractDates(String message, Map<String, String> entities) {
         // Try ISO format first (YYYY-MM-DD)
@@ -139,6 +147,35 @@ public class EntityExtractor {
                 return;
             } catch (DateTimeParseException e) {
                 log.debug("Invalid ISO date format: {}", dateStr);
+            }
+        }
+
+        // Try month name format (e.g., "november 4th", "nov 4")
+        Matcher monthNameMatcher = DATE_MONTH_NAME_PATTERN.matcher(message);
+        if (monthNameMatcher.find()) {
+            String monthName = monthNameMatcher.group(1).toLowerCase();
+            String day = monthNameMatcher.group(2);
+            
+            try {
+                int month = parseMonthName(monthName);
+                int dayInt = Integer.parseInt(day);
+                
+                // Determine year: use current year, or next year if date has passed
+                int currentYear = LocalDate.now().getYear();
+                LocalDate candidateDate = LocalDate.of(currentYear, month, dayInt);
+                
+                // If the date is in the past and no year was explicitly mentioned, use next year
+                if (candidateDate.isBefore(LocalDate.now())) {
+                    candidateDate = LocalDate.of(currentYear + 1, month, dayInt);
+                    log.debug("Date {} is in the past, using next year: {}", 
+                        monthName + " " + day, candidateDate);
+                }
+                
+                entities.put("date", candidateDate.toString());
+                log.debug("Extracted month name date: {}", candidateDate);
+                return;
+            } catch (Exception e) {
+                log.debug("Invalid month name date format: {} {}", monthName, day);
             }
         }
 
@@ -297,6 +334,30 @@ public class EntityExtractor {
         }
 
         return today.plusDays(daysToAdd);
+    }
+
+    /**
+     * Parses month name (full or abbreviated) to month number.
+     * 
+     * @param monthName Month name (e.g., "january", "jan")
+     * @return Month number (1-12)
+     */
+    private int parseMonthName(String monthName) {
+        return switch (monthName.toLowerCase()) {
+            case "january", "jan" -> 1;
+            case "february", "feb" -> 2;
+            case "march", "mar" -> 3;
+            case "april", "apr" -> 4;
+            case "may" -> 5;
+            case "june", "jun" -> 6;
+            case "july", "jul" -> 7;
+            case "august", "aug" -> 8;
+            case "september", "sep", "sept" -> 9;
+            case "october", "oct" -> 10;
+            case "november", "nov" -> 11;
+            case "december", "dec" -> 12;
+            default -> throw new IllegalArgumentException("Invalid month name: " + monthName);
+        };
     }
 
     /**

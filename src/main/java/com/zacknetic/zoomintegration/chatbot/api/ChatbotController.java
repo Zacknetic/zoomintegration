@@ -126,7 +126,7 @@ public class ChatbotController {
         try {
             // Process message through chatbot engine with authenticated user
             ChatbotEngine.ChatbotResponse engineResponse =
-                chatbotEngine.processMessage(zoomUserId, request.getMessage());
+                chatbotEngine.processMessage(zoomUserId, request.getMessage(), request.getTimezone());
 
             // Build API response
             ChatResponse response = ChatResponse.builder()
@@ -277,6 +277,12 @@ public class ChatbotController {
             required = true
         )
         private String message;
+        
+        @Schema(
+            description = "User's timezone ID (optional, defaults to UTC)",
+            example = "America/New_York"
+        )
+        private String timezone;
     }
 
     /**
