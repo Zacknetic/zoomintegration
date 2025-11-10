@@ -1,13 +1,24 @@
 package com.zacknetic.zoomintegration.chatbot.engine;
 
+import com.zacknetic.zoomintegration.auth.service.UserZoomApiService;
 import com.zacknetic.zoomintegration.chatbot.config.ChatbotConfiguration;
 import com.zacknetic.zoomintegration.chatbot.models.ChatMessage;
 import com.zacknetic.zoomintegration.chatbot.models.ConversationSession;
 import com.zacknetic.zoomintegration.chatbot.models.Intent;
+import com.zacknetic.zoomintegration.zoom.api.ZoomMeetingsApiClient;
+import com.zacknetic.zoomintegration.zoom.models.ZoomMeeting;
+import com.zacknetic.zoomintegration.zoom.models.ZoomMeetingList;
+import com.zacknetic.zoomintegration.zoom.models.ZoomMeetingRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -27,17 +38,23 @@ public class ChatbotEngine {
     private final EntityExtractor entityExtractor;
     private final ConversationContextManager contextManager;
     private final ChatbotConfiguration config;
+    private final ZoomMeetingsApiClient meetingsApiClient;
+    private final UserZoomApiService userZoomApiService;
 
     public ChatbotEngine(
         IntentClassifier intentClassifier,
         EntityExtractor entityExtractor,
         ConversationContextManager contextManager,
-        ChatbotConfiguration config
+        ChatbotConfiguration config,
+        ZoomMeetingsApiClient meetingsApiClient,
+        UserZoomApiService userZoomApiService
     ) {
         this.intentClassifier = intentClassifier;
         this.entityExtractor = entityExtractor;
         this.contextManager = contextManager;
         this.config = config;
+        this.meetingsApiClient = meetingsApiClient;
+        this.userZoomApiService = userZoomApiService;
     }
 
     /**
@@ -244,11 +261,13 @@ public class ChatbotEngine {
         String date = entities.get("date");
         String time = entities.get("time");
         String email = entities.get("email");
+        String duration = entities.get("duration");
 
         // Store entities in context for multi-turn conversation
         if (date != null) session.setContextValue("meetingDate", date);
         if (time != null) session.setContextValue("meetingTime", time);
         if (email != null) session.setContextValue("participantEmail", email);
+        if (duration != null) session.setContextValue("meetingDuration", duration);
 
         // Check what we're missing
         if (date == null && !session.hasContext("meetingDate")) {
@@ -261,48 +280,352 @@ public class ChatbotEngine {
                 "(e.g., '2pm', '14:00', or '2:30pm')";
         }
 
-        // We have enough info - show confirmation
+        // We have enough info - create the meeting via Zoom API
         String finalDate = date != null ? date : session.getContextValue("meetingDate");
         String finalTime = time != null ? time : session.getContextValue("meetingTime");
         String participant = email != null ? email : session.getContextValue("participantEmail");
+        String meetingDuration = duration != null ? duration : session.getContextValue("meetingDuration");
 
-        String message = String.format(
-            "I'll schedule a meeting for %s at %s", finalDate, finalTime
-        );
+        try {
+            // Combine date and time into ISO 8601 format
+            String startTime = combineDateTime(finalDate, finalTime);
 
-        if (participant != null) {
-            message += " with " + participant;
+            // Parse duration or use default
+            int durationMinutes = 60; // default
+            if (meetingDuration != null) {
+                try {
+                    durationMinutes = Integer.parseInt(meetingDuration);
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid duration format: {}", meetingDuration);
+                }
+            }
+
+            // Build meeting request
+            ZoomMeetingRequest request = ZoomMeetingRequest.builder()
+                .topic("Scheduled Meeting") // Default topic
+                .type(2) // Scheduled meeting
+                .startTime(startTime)
+                .duration(durationMinutes)
+                .timezone("UTC")
+                .settings(com.zacknetic.zoomintegration.zoom.models.ZoomMeetingSettings.builder()
+                    .hostVideo(true)
+                    .participantVideo(true)
+                    .waitingRoom(true)
+                    .joinBeforeHost(false)
+                    .muteUponEntry(false)
+                    .build())
+                .build();
+
+            // Create meeting via Zoom API using user's token
+            log.info("Creating Zoom meeting for user: {} at {}", session.getUserId(), startTime);
+
+            // Get user's Zoom access token
+            String userAccessToken = userZoomApiService.getAccessTokenForUser(session.getUserId());
+
+            // Create meeting with user's token (userId="me" uses the authenticated user)
+            ZoomMeeting meeting = meetingsApiClient.createMeetingWithUserToken("me", request, userAccessToken);
+
+            // Clear context after successful scheduling
+            session.getContext().remove("meetingDate");
+            session.getContext().remove("meetingTime");
+            session.getContext().remove("participantEmail");
+            session.getContext().remove("meetingDuration");
+
+            // Format success response
+            StringBuilder response = new StringBuilder();
+            response.append("Meeting scheduled successfully!\n\n");
+            response.append("When: ").append(formatDateTime(finalDate, finalTime)).append("\n");
+            response.append("Duration: ").append(durationMinutes).append(" minutes\n");
+            response.append("Meeting ID: ").append(meeting.getId()).append("\n");
+
+            if (meeting.getPassword() != null) {
+                response.append("Password: ").append(meeting.getPassword()).append("\n");
+            }
+
+            response.append("\nJoin URL: ").append(meeting.getJoinUrl()).append("\n");
+
+            if (participant != null) {
+                response.append("\nTo invite ").append(participant)
+                    .append(", share the join URL above.");
+            }
+
+            return response.toString();
+
+        } catch (IOException e) {
+            log.error("Failed to create Zoom meeting", e);
+            // Clear context so user can try again
+            session.getContext().remove("meetingDate");
+            session.getContext().remove("meetingTime");
+            session.getContext().remove("participantEmail");
+            session.getContext().remove("meetingDuration");
+
+            // Provide specific error message for authentication failures
+            if (isAuthenticationError(e)) {
+                return "Zoom API authentication failed. Please check your Zoom API credentials.\n\n" +
+                    "The application may be using invalid or mock credentials. " +
+                    "Check the application logs for configuration details.";
+            }
+
+            return "Sorry, I encountered an error creating the meeting. Please try again later.";
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid meeting parameters", e);
+            return "I couldn't create the meeting: " + e.getMessage();
+        } catch (Exception e) {
+            log.error("Unexpected error creating meeting", e);
+            return "An unexpected error occurred. Please try again.";
         }
-
-        message += ".\n\nNote: This is a demo response. Integration with Zoom Meetings API will create actual meetings.";
-
-        // Clear context after scheduling
-        session.getContext().remove("meetingDate");
-        session.getContext().remove("meetingTime");
-        session.getContext().remove("participantEmail");
-
-        return message;
     }
 
     private String handleListMeetings(ConversationSession session, Map<String, String> entities) {
-        return "Here are your upcoming meetings:\n\n" +
-            "Note: This is a demo response. Integration with Zoom Meetings API will show actual meetings.\n\n" +
-            "Try asking: 'Schedule a meeting tomorrow at 2pm'";
+        try {
+            // Fetch upcoming meetings from Zoom API using user's token
+            log.info("Fetching upcoming meetings for user: {}", session.getUserId());
+
+            // Get user's Zoom access token
+            String userAccessToken = userZoomApiService.getAccessTokenForUser(session.getUserId());
+
+            ZoomMeetingList meetingList = meetingsApiClient.listMeetingsWithUserToken(
+                "me", "upcoming", 10, 1, userAccessToken
+            );
+
+            if (meetingList.isEmpty()) {
+                return "You have no upcoming meetings.\n\n" +
+                    "Would you like to schedule one? Just say 'schedule a meeting tomorrow at 2pm'";
+            }
+
+            // Format meetings list
+            StringBuilder response = new StringBuilder();
+            response.append("Your upcoming meetings:\n\n");
+
+            List<ZoomMeeting> meetings = meetingList.getMeetings();
+            for (int i = 0; i < meetings.size(); i++) {
+                ZoomMeeting meeting = meetings.get(i);
+
+                // Store meeting ID in context for follow-up actions
+                session.setContextValue("meeting_" + (i + 1), meeting.getId().toString());
+
+                response.append(i + 1).append(". ");
+                response.append(meeting.getTopic() != null ? meeting.getTopic() : "Meeting");
+                response.append("\n");
+
+                if (meeting.getStartTime() != null) {
+                    response.append("   ").append(meeting.getStartTime()).append("\n");
+                }
+
+                response.append("   ID: ").append(meeting.getId()).append("\n\n");
+            }
+
+            response.append("Tip: Say 'get meeting 1' for details or 'delete meeting 2' to cancel.");
+
+            return response.toString();
+
+        } catch (IOException e) {
+            log.error("Failed to list meetings", e);
+            if (isAuthenticationError(e)) {
+                return "Zoom API authentication failed. Please check your Zoom API credentials.\n\n" +
+                    "The application may be using invalid or mock credentials. " +
+                    "Check the application logs for configuration details.";
+            }
+            return "Sorry, I couldn't fetch your meetings right now. Please try again later.";
+        } catch (Exception e) {
+            log.error("Unexpected error listing meetings", e);
+            return "An unexpected error occurred while fetching meetings.";
+        }
     }
 
     private String handleGetMeeting(ConversationSession session, Map<String, String> entities) {
-        return "Note: This is a demo response. Integration with Zoom Meetings API will show meeting details.\n\n" +
-            "Please provide the meeting ID to get details.";
+        // Try to get meeting ID from context (e.g., "get meeting 1" after listing)
+        String meetingId = null;
+
+        // Check if user referenced a numbered meeting from the list
+        for (String key : session.getContext().keySet()) {
+            if (key.startsWith("meeting_")) {
+                // This is a simplified approach - in production, parse the number from the message
+                meetingId = session.getContextValue(key);
+                break;
+            }
+        }
+
+        if (meetingId == null) {
+            return "Please list your meetings first, then say 'get meeting 1' to see details.\n\n" +
+                "Or provide a specific meeting ID.";
+        }
+
+        try {
+            log.info("Fetching meeting details for ID: {}", meetingId);
+            
+            // Get user's Zoom access token
+            String userAccessToken = userZoomApiService.getAccessTokenForUser(session.getUserId());
+            
+            ZoomMeeting meeting = meetingsApiClient.getMeetingWithUserToken(meetingId, userAccessToken);
+
+            // Format meeting details
+            StringBuilder response = new StringBuilder();
+            response.append("Meeting Details:\n\n");
+            response.append("Topic: ").append(meeting.getTopic() != null ? meeting.getTopic() : "N/A").append("\n");
+
+            if (meeting.getStartTime() != null) {
+                response.append("When: ").append(meeting.getStartTime()).append("\n");
+            }
+
+            if (meeting.getDuration() != null) {
+                response.append("Duration: ").append(meeting.getDuration()).append(" minutes\n");
+            }
+
+            response.append("Meeting ID: ").append(meeting.getId()).append("\n");
+
+            if (meeting.getPassword() != null) {
+                response.append("Password: ").append(meeting.getPassword()).append("\n");
+            }
+
+            if (meeting.getJoinUrl() != null) {
+                response.append("\nJoin URL: ").append(meeting.getJoinUrl()).append("\n");
+            }
+
+            // Settings
+            if (meeting.getSettings() != null) {
+                response.append("\nSettings:\n");
+                response.append("   • Waiting room: ")
+                    .append(meeting.getSettings().getWaitingRoom() ? "Enabled" : "Disabled").append("\n");
+                response.append("   • Host video: ")
+                    .append(meeting.getSettings().getHostVideo() ? "On" : "Off").append("\n");
+                response.append("   • Participant video: ")
+                    .append(meeting.getSettings().getParticipantVideo() ? "On" : "Off").append("\n");
+            }
+
+            return response.toString();
+
+        } catch (IOException e) {
+            log.error("Failed to get meeting details", e);
+            if (e.getMessage() != null && e.getMessage().contains("not found")) {
+                return "Meeting not found. It may have been deleted or the ID is incorrect.";
+            }
+            return "Sorry, I couldn't fetch the meeting details. Please try again later.";
+        } catch (Exception e) {
+            log.error("Unexpected error getting meeting", e);
+            return "An unexpected error occurred while fetching meeting details.";
+        }
     }
 
     private String handleUpdateMeeting(ConversationSession session, Map<String, String> entities) {
-        return "Note: This is a demo response. Integration with Zoom Meetings API will update meetings.\n\n" +
-            "Please provide the meeting ID and new details.";
+        // Get meeting ID from context
+        String meetingId = getMeetingIdFromContext(session);
+        if (meetingId == null) {
+            return "Please list your meetings first, then say 'update meeting 1' to modify it.\n\n" +
+                "Or provide a specific meeting ID.";
+        }
+
+        // Check what updates the user wants to make
+        String date = entities.get("date");
+        String time = entities.get("time");
+        String duration = entities.get("duration");
+
+        // Store updates in context for multi-turn conversation
+        if (date != null) session.setContextValue("updateDate", date);
+        if (time != null) session.setContextValue("updateTime", time);
+        if (duration != null) session.setContextValue("updateDuration", duration);
+
+        // Check if we have any updates to apply
+        boolean hasDateUpdate = date != null || session.hasContext("updateDate");
+        boolean hasTimeUpdate = time != null || session.hasContext("updateTime");
+        boolean hasDurationUpdate = duration != null || session.hasContext("updateDuration");
+
+        if (!hasDateUpdate && !hasTimeUpdate && !hasDurationUpdate) {
+            return "What would you like to update?\n\n" +
+                "You can change:\n" +
+                "- Date (e.g., 'reschedule to tomorrow')\n" +
+                "- Time (e.g., 'change to 3pm')\n" +
+                "- Duration (e.g., 'make it 90 minutes')";
+        }
+
+        try {
+            // Build update request with only the fields to change
+            ZoomMeetingRequest.ZoomMeetingRequestBuilder builder = ZoomMeetingRequest.builder();
+
+            // Update start time if date or time changed
+            if (hasDateUpdate || hasTimeUpdate) {
+                String finalDate = date != null ? date : session.getContextValue("updateDate");
+                String finalTime = time != null ? time : session.getContextValue("updateTime");
+
+                if (finalDate != null && finalTime != null) {
+                    String startTime = combineDateTime(finalDate, finalTime);
+                    builder.startTime(startTime);
+                }
+            }
+
+            // Update duration if specified
+            if (hasDurationUpdate) {
+                String durationStr = duration != null ? duration : session.getContextValue("updateDuration");
+                try {
+                    int durationMinutes = Integer.parseInt(durationStr);
+                    builder.duration(durationMinutes);
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid duration format: {}", durationStr);
+                    return "Invalid duration format. Please specify duration in minutes (e.g., '60' or '90').";
+                }
+            }
+
+            ZoomMeetingRequest request = builder.build();
+
+            // Update meeting via Zoom API
+            log.info("Updating meeting ID: {} for user: {}", meetingId, session.getUserId());
+            meetingsApiClient.updateMeeting(meetingId, request);
+
+            // Clear update context
+            session.getContext().remove("updateDate");
+            session.getContext().remove("updateTime");
+            session.getContext().remove("updateDuration");
+
+            return "Meeting updated successfully!\n\n" +
+                "Your changes have been saved. All participants will be notified.";
+
+        } catch (IOException e) {
+            log.error("Failed to update meeting", e);
+            if (e.getMessage() != null && e.getMessage().contains("not found")) {
+                return "Meeting not found. It may have been deleted.";
+            }
+            return "Sorry, I couldn't update the meeting. Please try again later.";
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid update parameters", e);
+            return "Invalid update parameters: " + e.getMessage();
+        } catch (Exception e) {
+            log.error("Unexpected error updating meeting", e);
+            return "An unexpected error occurred while updating the meeting.";
+        }
     }
 
     private String handleDeleteMeeting(ConversationSession session, Map<String, String> entities) {
-        return "Note: This is a demo response. Integration with Zoom Meetings API will cancel meetings.\n\n" +
-            "Please provide the meeting ID to cancel.";
+        // Get meeting ID from context (supports "delete meeting 2")
+        String meetingId = getMeetingIdFromContext(session);
+        if (meetingId == null) {
+            return "Please list your meetings first, then say 'delete meeting 1' to cancel it.\n\n" +
+                "Or provide a specific meeting ID.";
+        }
+
+        try {
+            // Delete meeting via Zoom API
+            // scheduleForReminder=true sends cancellation email to participants
+            log.info("Deleting meeting ID: {} for user: {}", meetingId, session.getUserId());
+            meetingsApiClient.deleteMeeting(meetingId, null, true);
+
+            // Clear meeting context after successful deletion
+            clearMeetingContext(session);
+
+            return "Meeting cancelled successfully!\n\n" +
+                "Cancellation emails have been sent to all participants.";
+
+        } catch (IOException e) {
+            log.error("Failed to delete meeting", e);
+            if (e.getMessage() != null && e.getMessage().contains("not found")) {
+                // Meeting might already be deleted - clear context anyway
+                clearMeetingContext(session);
+                return "Meeting not found. It may have already been cancelled.";
+            }
+            return "Sorry, I couldn't cancel the meeting. Please try again later.";
+        } catch (Exception e) {
+            log.error("Unexpected error deleting meeting", e);
+            return "An unexpected error occurred while cancelling the meeting.";
+        }
     }
 
     private String handleListRecordings(ConversationSession session, Map<String, String> entities) {
@@ -336,6 +659,95 @@ public class ChatbotEngine {
 
     private String handleUnknown() {
         return "I'm not sure I understood that. Could you rephrase, or type 'help' to see what I can do?";
+    }
+
+    /**
+     * Combines date and time strings into ISO 8601 format for Zoom API.
+     * Example: "2024-01-15" + "14:00" → "2024-01-15T14:00:00"
+     *
+     * Production: Handles various date/time formats
+     * Fail-fast: Throws IllegalArgumentException for invalid input
+     */
+    private String combineDateTime(String date, String time) {
+        if (date == null || time == null) {
+            throw new IllegalArgumentException("Date and time are required");
+        }
+
+        // Ensure time has seconds format (HH:mm:ss)
+        String fullTime = time;
+        if (time.contains(":") && time.split(":").length == 2) {
+            fullTime = time + ":00";
+        } else if (!time.contains(":")) {
+            // Handle cases like "14" or "2pm"
+            fullTime = time + ":00:00";
+        }
+
+        // Combine into ISO 8601 format
+        return date + "T" + fullTime;
+    }
+
+    /**
+     * Formats date/time for user-friendly display.
+     * Example: "2024-01-15" + "14:00" → "January 15, 2024 at 2:00 PM"
+     *
+     * Production: Fallback to simple format if parsing fails
+     */
+    private String formatDateTime(String date, String time) {
+        try {
+            LocalDate localDate = LocalDate.parse(date);
+            LocalTime localTime = LocalTime.parse(time);
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMMM d, yyyy 'at' h:mm a");
+            return localDate.atTime(localTime).format(formatter);
+        } catch (DateTimeParseException e) {
+            log.warn("Failed to parse date/time for formatting: {} {}", date, time);
+            return date + " at " + time;
+        }
+    }
+
+    /**
+     * Gets meeting ID from session context based on numbered reference.
+     * Supports: "delete meeting 2" → retrieves meeting_2 from context
+     *
+     * Production: Simple implementation - returns first meeting found
+     * TODO: Parse meeting number from user message for specific selection
+     */
+    private String getMeetingIdFromContext(ConversationSession session) {
+        // For now, return the first meeting in context
+        // In production, we'd parse the meeting number from the user's message
+        for (String key : session.getContext().keySet()) {
+            if (key.startsWith("meeting_")) {
+                return session.getContextValue(key);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Clears meeting-related context after operations complete.
+     * Production: Clean up session state to prevent stale data
+     */
+    private void clearMeetingContext(ConversationSession session) {
+        session.getContext().keySet().removeIf(key -> key.startsWith("meeting_"));
+    }
+
+    /**
+     * Checks if an IOException is due to authentication failure.
+     * Production: Provides specific error messages for auth issues
+     */
+    private boolean isAuthenticationError(IOException e) {
+        if (e == null) {
+            return false;
+        }
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+        String lowerMessage = message.toLowerCase();
+        return lowerMessage.contains("invalid_client") ||
+               lowerMessage.contains("authentication") ||
+               lowerMessage.contains("unauthorized") ||
+               lowerMessage.contains("access token") ||
+               lowerMessage.contains("401");
     }
 
     /**

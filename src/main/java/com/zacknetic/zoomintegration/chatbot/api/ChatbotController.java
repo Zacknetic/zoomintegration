@@ -17,6 +17,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Instant;
@@ -63,7 +65,8 @@ public class ChatbotController {
     @Operation(
         summary = "Send message to chatbot",
         description = "Send a message to the Zoom assistant chatbot and receive a response. " +
-            "The chatbot can help with scheduling meetings, managing recordings, and user operations."
+            "The chatbot can help with scheduling meetings, managing recordings, and user operations. " +
+            "Requires authentication via JWT token in Authorization header."
     )
     @ApiResponse(
         responseCode = "200",
@@ -71,26 +74,44 @@ public class ChatbotController {
         content = @Content(schema = @Schema(implementation = ChatResponse.class))
     )
     @ApiResponse(responseCode = "400", description = "Invalid request")
+    @ApiResponse(responseCode = "401", description = "Unauthorized - missing or invalid JWT token")
     @ApiResponse(responseCode = "500", description = "Internal server error")
     public ResponseEntity<ChatResponse> chat(@RequestBody ChatRequest request) {
-        // Validate request
-        if (request == null || request.getUserId() == null || request.getUserId().isBlank()) {
-            log.warn("Chat request missing user ID");
-            return ResponseEntity.badRequest().body(
+        // Extract authenticated user from Spring Security context
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+        if (authentication == null || !authentication.isAuthenticated()) {
+            log.warn("Chat request from unauthenticated user");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(
                 ChatResponse.builder()
                     .success(false)
-                    .error("User ID is required")
+                    .error("Authentication required. Please login at /api/auth/login")
                     .timestamp(Instant.now())
                     .build()
             );
         }
 
-        if (request.getMessage() == null || request.getMessage().isBlank()) {
-            log.warn("Chat request missing message for user: {}", request.getUserId());
+        // Get Zoom user ID from authentication (username = Zoom user ID)
+        String zoomUserId = authentication.getName();
+
+        if (zoomUserId == null || zoomUserId.isBlank()) {
+            log.warn("Chat request with invalid authentication");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(
+                ChatResponse.builder()
+                    .success(false)
+                    .error("Invalid authentication")
+                    .timestamp(Instant.now())
+                    .build()
+            );
+        }
+
+        // Validate message
+        if (request == null || request.getMessage() == null || request.getMessage().isBlank()) {
+            log.warn("Chat request missing message for user: {}", zoomUserId);
             return ResponseEntity.badRequest().body(
                 ChatResponse.builder()
                     .success(false)
-                    .userId(request.getUserId())
+                    .userId(zoomUserId)
                     .error("Message is required")
                     .timestamp(Instant.now())
                     .build()
@@ -98,14 +119,14 @@ public class ChatbotController {
         }
 
         // Log request (with PII redaction)
-        log.info("Chat request from user: {}, message: {}",
-            request.getUserId(),
+        log.info("Chat request from authenticated user: {}, message: {}",
+            zoomUserId,
             piiRedactionService.redactForLogging(request.getMessage()));
 
         try {
-            // Process message through chatbot engine
+            // Process message through chatbot engine with authenticated user
             ChatbotEngine.ChatbotResponse engineResponse =
-                chatbotEngine.processMessage(request.getUserId(), request.getMessage());
+                chatbotEngine.processMessage(zoomUserId, request.getMessage());
 
             // Build API response
             ChatResponse response = ChatResponse.builder()
@@ -120,7 +141,7 @@ public class ChatbotController {
                 .build();
 
             log.info("Chat response sent to user: {}, intent: {}",
-                request.getUserId(),
+                zoomUserId,
                 engineResponse.getIntent());
 
             return ResponseEntity.ok(response);
@@ -130,18 +151,18 @@ public class ChatbotController {
             return ResponseEntity.badRequest().body(
                 ChatResponse.builder()
                     .success(false)
-                    .userId(request.getUserId())
+                    .userId(zoomUserId)
                     .error(e.getMessage())
                     .timestamp(Instant.now())
                     .build()
             );
 
         } catch (Exception e) {
-            log.error("Error processing chat request for user: {}", request.getUserId(), e);
+            log.error("Error processing chat request for user: {}", zoomUserId, e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
                 ChatResponse.builder()
                     .success(false)
-                    .userId(request.getUserId())
+                    .userId(zoomUserId)
                     .error("An error occurred processing your message. Please try again.")
                     .timestamp(Instant.now())
                     .build()
@@ -242,6 +263,7 @@ public class ChatbotController {
     /**
      * Chat request DTO.
      * Production: Explicit request structure with validation
+     * Security: User ID extracted from JWT token, not from request body
      */
     @Data
     @NoArgsConstructor
@@ -249,10 +271,11 @@ public class ChatbotController {
     @Builder
     @Schema(description = "Chat request to send a message to the chatbot")
     public static class ChatRequest {
-        @Schema(description = "User ID (required)", example = "user123", required = true)
-        private String userId;
-
-        @Schema(description = "User's message (required)", example = "Schedule a meeting tomorrow at 2pm", required = true)
+        @Schema(
+            description = "User's message (required)",
+            example = "Schedule a meeting tomorrow at 2pm",
+            required = true
+        )
         private String message;
     }
 

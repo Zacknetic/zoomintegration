@@ -8,20 +8,32 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 @ConfigurationProperties(prefix = "zoom")
 public class ZoomConfig {
-    
+
     private Api api = new Api();
     private OAuth oauth = new OAuth();
-    
+
     @Data
     public static class Api {
         private String baseUrl;
     }
-    
+
     @Data
     public static class OAuth {
         private String tokenUrl;
         private String accountId;
         private String clientId;
         private String clientSecret;
+        private UserOAuth user = new UserOAuth();
+
+        @Data
+        public static class UserOAuth {
+            private String authorizationUrl;
+            private String tokenUrl;
+            private String userInfoUrl;
+            private String clientId;
+            private String clientSecret;
+            private String redirectUri;
+            private String scopes;
+        }
     }
 }
